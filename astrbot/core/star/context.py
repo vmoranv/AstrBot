@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 import logging
 from asyncio import Queue
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 from deprecated import deprecated
 
@@ -18,7 +20,6 @@ from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.persona_mgr import PersonaManager
 from astrbot.core.platform import Platform
 from astrbot.core.platform.astr_message_event import AstrMessageEvent, MessageSesion
-from astrbot.core.platform.manager import PlatformManager
 from astrbot.core.platform_message_history_mgr import PlatformMessageHistoryManager
 from astrbot.core.provider.entities import LLMResponse, ProviderRequest, ProviderType
 from astrbot.core.provider.func_tool_manager import FunctionTool, FunctionToolManager
@@ -34,6 +35,8 @@ from astrbot.core.star.filter.platform_adapter_type import (
     ADAPTER_NAME_2_TYPE,
     PlatformAdapterType,
 )
+from astrbot.core.subagent_orchestrator import SubAgentOrchestrator
+from astrbot.core.utils.astrbot_path import get_astrbot_system_tmp_path
 
 from ..exceptions import ProviderNotFoundError
 from .filter.command import CommandFilter
@@ -42,6 +45,13 @@ from .star import StarMetadata, star_map, star_registry
 from .star_handler import EventType, StarHandlerMetadata, star_handlers_registry
 
 logger = logging.getLogger("astrbot")
+
+if TYPE_CHECKING:
+    from astrbot.core.cron.manager import CronJobManager
+
+
+class PlatformManagerProtocol(Protocol):
+    platform_insts: list[Platform]
 
 
 class Context:
@@ -59,13 +69,15 @@ class Context:
         config: AstrBotConfig,
         db: BaseDatabase,
         provider_manager: ProviderManager,
-        platform_manager: PlatformManager,
+        platform_manager: PlatformManagerProtocol,
         conversation_manager: ConversationManager,
         message_history_manager: PlatformMessageHistoryManager,
         persona_manager: PersonaManager,
         astrbot_config_mgr: AstrBotConfigManager,
         knowledge_base_manager: KnowledgeBaseManager,
-    ):
+        cron_manager: CronJobManager,
+        subagent_orchestrator: SubAgentOrchestrator | None = None,
+    ) -> None:
         self._event_queue = event_queue
         """事件队列。消息平台通过事件队列传递消息事件。"""
         self._config = config
@@ -86,6 +98,9 @@ class Context:
         """配置文件管理器(非webui)"""
         self.kb_manager = knowledge_base_manager
         """知识库管理器"""
+        self.cron_manager = cron_manager
+        """Cron job manager, initialized by core lifecycle."""
+        self.subagent_orchestrator = subagent_orchestrator
 
     async def llm_generate(
         self,
@@ -93,6 +108,7 @@ class Context:
         chat_provider_id: str,
         prompt: str | None = None,
         image_urls: list[str] | None = None,
+        audio_urls: list[str] | None = None,
         tools: ToolSet | None = None,
         system_prompt: str | None = None,
         contexts: list[Message] | None = None,
@@ -106,6 +122,7 @@ class Context:
             chat_provider_id: The chat provider ID to use.
             prompt: The prompt to send to the LLM, if `contexts` and `prompt` are both provided, `prompt` will be appended as the last user message
             image_urls: List of image URLs to include in the prompt, if `contexts` and `prompt` are both provided, `image_urls` will be appended to the last user message
+            audio_urls: List of audio URLs or local paths to include in the prompt, if `contexts` and `prompt` are both provided, `audio_urls` will be appended to the last user message
             tools: ToolSet of tools available to the LLM
             system_prompt: System prompt to guide the LLM's behavior, if provided, it will always insert as the first system message in the context
             contexts: context messages for the LLM
@@ -121,6 +138,7 @@ class Context:
         llm_resp = await prov.text_chat(
             prompt=prompt,
             image_urls=image_urls,
+            audio_urls=audio_urls,
             func_tool=tools,
             contexts=contexts,
             system_prompt=system_prompt,
@@ -135,11 +153,12 @@ class Context:
         chat_provider_id: str,
         prompt: str | None = None,
         image_urls: list[str] | None = None,
+        audio_urls: list[str] | None = None,
         tools: ToolSet | None = None,
         system_prompt: str | None = None,
         contexts: list[Message] | None = None,
         max_steps: int = 30,
-        tool_call_timeout: int = 60,
+        tool_call_timeout: int = 120,
         **kwargs: Any,
     ) -> LLMResponse:
         """Run an agent loop that allows the LLM to call tools iteratively until a final answer is produced.
@@ -151,6 +170,7 @@ class Context:
             chat_provider_id: The chat provider ID to use.
             prompt: The prompt to send to the LLM, if `contexts` and `prompt` are both provided, `prompt` will be appended as the last user message
             image_urls: List of image URLs to include in the prompt, if `contexts` and `prompt` are both provided, `image_urls` will be appended to the last user message
+            audio_urls: List of audio URLs or local paths to include in the prompt, if `contexts` and `prompt` are both provided, `audio_urls` will be appended to the last user message
             tools: ToolSet of tools available to the LLM
             system_prompt: System prompt to guide the LLM's behavior, if provided, it will always insert as the first system message in the context
             contexts: context messages for the LLM
@@ -193,6 +213,7 @@ class Context:
         request = ProviderRequest(
             prompt=prompt,
             image_urls=image_urls or [],
+            audio_urls=audio_urls or [],
             func_tool=tools,
             contexts=context_,
             system_prompt=system_prompt or "",
@@ -212,6 +233,13 @@ class Context:
             for k, v in kwargs.items()
             if k not in ["stream", "agent_hooks", "agent_context"]
         }
+        if request.func_tool and request.func_tool.get_tool("astrbot_file_read_tool"):
+            other_kwargs.setdefault(
+                "tool_result_overflow_dir", get_astrbot_system_tmp_path()
+            )
+            other_kwargs.setdefault(
+                "read_tool", request.func_tool.get_tool("astrbot_file_read_tool")
+            )
 
         await agent_runner.reset(
             provider=prov,
@@ -441,6 +469,9 @@ class Context:
             if platform.meta().id == session.platform_name:
                 await platform.send_by_session(session, message_chain)
                 return True
+        logger.warning(
+            f"cannot find platform for session {str(session)}, message not sent"
+        )
         return False
 
     def add_llm_tools(self, *tools: FunctionTool) -> None:
@@ -463,6 +494,7 @@ class Context:
                     _parts.append(part)
                     if part in flags and i + 1 < len(module_part):
                         _parts.append(module_part[i + 1])
+                        _parts.append("main")
                         break
                 tool.handler_module_path = ".".join(_parts)
                 module_path = tool.handler_module_path
@@ -483,7 +515,7 @@ class Context:
         view_handler: Awaitable,
         methods: list,
         desc: str,
-    ):
+    ) -> None:
         """注册 Web API。
 
         Args:
@@ -557,7 +589,7 @@ class Context:
         """
         return self._db
 
-    def register_provider(self, provider: Provider):
+    def register_provider(self, provider: Provider) -> None:
         """注册一个 LLM Provider(Chat_Completion 类型)。
 
         Args:
@@ -618,7 +650,7 @@ class Context:
         awaitable: Callable[..., Awaitable[Any]],
         use_regex=False,
         ignore_prefix=False,
-    ):
+    ) -> None:
         """[DEPRECATED]注册一个命令。
 
         Args:
@@ -650,7 +682,7 @@ class Context:
             )
         star_handlers_registry.append(md)
 
-    def register_task(self, task: Awaitable, desc: str):
+    def register_task(self, task: Awaitable, desc: str) -> None:
         """[DEPRECATED]注册一个异步任务。
 
         Args:

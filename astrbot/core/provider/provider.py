@@ -2,7 +2,7 @@ import abc
 import asyncio
 import os
 from collections.abc import AsyncGenerator
-from typing import TypeAlias, Union
+from typing import Literal, TypeAlias, Union
 
 from astrbot.core.agent.message import ContentPart, Message
 from astrbot.core.agent.tool import ToolSet
@@ -32,7 +32,7 @@ class AbstractProvider(abc.ABC):
         self.model_name = ""
         self.provider_config = provider_config
 
-    def set_model(self, model_name: str):
+    def set_model(self, model_name: str) -> None:
         """Set the current model name"""
         self.model_name = model_name
 
@@ -54,7 +54,7 @@ class AbstractProvider(abc.ABC):
         )
         return meta
 
-    async def test(self):
+    async def test(self) -> None:
         """test the provider is a
 
         raises:
@@ -84,7 +84,7 @@ class Provider(AbstractProvider):
         return keys or [""]
 
     @abc.abstractmethod
-    def set_key(self, key: str):
+    def set_key(self, key: str) -> None:
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -98,12 +98,14 @@ class Provider(AbstractProvider):
         prompt: str | None = None,
         session_id: str | None = None,
         image_urls: list[str] | None = None,
+        audio_urls: list[str] | None = None,
         func_tool: ToolSet | None = None,
         contexts: list[Message] | list[dict] | None = None,
         system_prompt: str | None = None,
         tool_calls_result: ToolCallsResult | list[ToolCallsResult] | None = None,
         model: str | None = None,
         extra_user_content_parts: list[ContentPart] | None = None,
+        tool_choice: Literal["auto", "required"] = "auto",
         **kwargs,
     ) -> LLMResponse:
         """获得 LLM 的文本对话结果。会使用当前的模型进行对话。
@@ -112,7 +114,9 @@ class Provider(AbstractProvider):
             prompt: 提示词，和 contexts 二选一使用，如果都指定，则会将 prompt（以及可能的 image_urls） 作为最新的一条记录添加到 contexts 中
             session_id: 会话 ID(此属性已经被废弃)
             image_urls: 图片 URL 列表
+            audio_urls: 音频 URL 列表，也支持本地路径
             tools: tool set
+            tool_choice: 工具调用策略，`auto` 表示由模型自行决定，`required` 表示要求模型必须调用工具
             contexts: 上下文，和 prompt 二选一使用
             tool_calls_result: 回传给 LLM 的工具调用结果。参考: https://platform.openai.com/docs/guides/function-calling
             extra_user_content_parts: 额外的内容块列表，用于在用户消息后添加额外的文本块（如系统提醒、指令等）
@@ -120,6 +124,7 @@ class Provider(AbstractProvider):
 
         Notes:
             - 如果传入了 image_urls，将会在对话时附上图片。如果模型不支持图片输入，将会抛出错误。
+            - 如果传入了 audio_urls，将会在对话时附上音频。如果模型不支持音频输入，将会抛出错误或降级处理。
             - 如果传入了 tools，将会使用 tools 进行 Function-calling。如果模型不支持 Function-calling，将会抛出错误。
 
         """
@@ -130,11 +135,13 @@ class Provider(AbstractProvider):
         prompt: str | None = None,
         session_id: str | None = None,
         image_urls: list[str] | None = None,
+        audio_urls: list[str] | None = None,
         func_tool: ToolSet | None = None,
         contexts: list[Message] | list[dict] | None = None,
         system_prompt: str | None = None,
         tool_calls_result: ToolCallsResult | list[ToolCallsResult] | None = None,
         model: str | None = None,
+        tool_choice: Literal["auto", "required"] = "auto",
         **kwargs,
     ) -> AsyncGenerator[LLMResponse, None]:
         """获得 LLM 的流式文本对话结果。会使用当前的模型进行对话。在生成的最后会返回一次完整的结果。
@@ -143,13 +150,16 @@ class Provider(AbstractProvider):
             prompt: 提示词，和 contexts 二选一使用，如果都指定，则会将 prompt（以及可能的 image_urls） 作为最新的一条记录添加到 contexts 中
             session_id: 会话 ID(此属性已经被废弃)
             image_urls: 图片 URL 列表
+            audio_urls: 音频 URL 列表，也支持本地路径
             tools: tool set
+            tool_choice: 工具调用策略，`auto` 表示由模型自行决定，`required` 表示要求模型必须调用工具
             contexts: 上下文，和 prompt 二选一使用
             tool_calls_result: 回传给 LLM 的工具调用结果。参考: https://platform.openai.com/docs/guides/function-calling
             kwargs: 其他参数
 
         Notes:
             - 如果传入了 image_urls，将会在对话时附上图片。如果模型不支持图片输入，将会抛出错误。
+            - 如果传入了 audio_urls，将会在对话时附上音频。如果模型不支持音频输入，将会抛出错误或降级处理。
             - 如果传入了 tools，将会使用 tools 进行 Function-calling。如果模型不支持 Function-calling，将会抛出错误。
 
         """
@@ -157,7 +167,7 @@ class Provider(AbstractProvider):
             yield None  # type: ignore
         raise NotImplementedError()
 
-    async def pop_record(self, context: list):
+    async def pop_record(self, context: list) -> None:
         """弹出 context 第一条非系统提示词对话记录"""
         poped = 0
         indexs_to_pop = []
@@ -188,7 +198,7 @@ class Provider(AbstractProvider):
 
         return dicts
 
-    async def test(self, timeout: float = 45.0):
+    async def test(self, timeout: float = 45.0) -> None:
         await asyncio.wait_for(
             self.text_chat(prompt="REPLY `PONG` ONLY"),
             timeout=timeout,
@@ -206,7 +216,7 @@ class STTProvider(AbstractProvider):
         """获取音频的文本"""
         raise NotImplementedError
 
-    async def test(self):
+    async def test(self) -> None:
         sample_audio_path = os.path.join(
             get_astrbot_path(),
             "samples",
@@ -280,8 +290,25 @@ class TTSProvider(AbstractProvider):
 
             accumulated_text += text_part
 
-    async def test(self):
-        await self.get_audio("hi")
+    async def test(self) -> None:
+        audio_path = await self.get_audio("hi")
+
+        # 检查生成的音频文件是否有效
+        if not os.path.exists(audio_path):
+            raise Exception("TTS test failed: audio file was not created")
+
+        file_size = os.path.getsize(audio_path)
+        if file_size == 0:
+            raise Exception(
+                "TTS test failed: generated audio file is empty (0 bytes). "
+                "Please check your TTS provider configuration, especially required parameters like group_id for MiniMax."
+            )
+
+        # 清理测试文件
+        try:
+            os.remove(audio_path)
+        except Exception:
+            pass
 
 
 class EmbeddingProvider(AbstractProvider):
@@ -305,7 +332,7 @@ class EmbeddingProvider(AbstractProvider):
         """获取向量的维度"""
         ...
 
-    async def test(self):
+    async def test(self) -> None:
         await self.get_embedding("astrbot")
 
     async def get_embeddings_batch(
@@ -335,7 +362,7 @@ class EmbeddingProvider(AbstractProvider):
         completed_count = 0
         total_count = len(texts)
 
-        async def process_batch(batch_idx: int, batch_texts: list[str]):
+        async def process_batch(batch_idx: int, batch_texts: list[str]) -> None:
             nonlocal completed_count
             async with semaphore:
                 for attempt in range(max_retries):
@@ -392,7 +419,7 @@ class RerankProvider(AbstractProvider):
         """获取查询和文档的重排序分数"""
         ...
 
-    async def test(self):
+    async def test(self) -> None:
         result = await self.rerank("Apple", documents=["apple", "banana"])
         if not result:
             raise Exception("Rerank provider test failed, no results returned")

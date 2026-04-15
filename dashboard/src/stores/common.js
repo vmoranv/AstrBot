@@ -1,8 +1,7 @@
 import { defineStore } from 'pinia';
 import axios from 'axios';
 
-export const useCommonStore = defineStore({
-  id: 'common',
+export const useCommonStore = defineStore("common", {
   state: () => ({
     // @ts-ignore
     eventSource: null,
@@ -132,13 +131,17 @@ export const useCommonStore = defineStore({
     getLogCache() {
       return this.log_cache
     },
+    async fetchStartTime() {
+      const res = await axios.get('/api/stat/start-time');
+      this.startTime = res.data.data.start_time;
+      return this.startTime;
+    },
     getStartTime() {
       if (this.startTime !== -1) {
         return this.startTime
       }
-      axios.get('/api/stat/start-time').then((res) => {
-        this.startTime = res.data.data.start_time
-      })
+      this.fetchStartTime().catch(() => {});
+      return this.startTime
     },
     async getPluginCollections(force = false, customSource = null) {
       // 获取插件市场数据
@@ -173,6 +176,15 @@ export const useCommonStore = defineStore({
                 "stars": pluginData?.stars ? pluginData.stars : 0,
                 "updated_at": pluginData?.updated_at ? pluginData.updated_at : "",
                 "display_name": pluginData?.display_name ? pluginData.display_name : "",
+                "astrbot_version": pluginData?.astrbot_version ? pluginData.astrbot_version : "",
+                "category": pluginData?.category ? pluginData.category : "",
+                "support_platforms": Array.isArray(pluginData?.support_platforms)
+                  ? pluginData.support_platforms
+                  : Array.isArray(pluginData?.support_platform)
+                    ? pluginData.support_platform
+                    : Array.isArray(pluginData?.platform)
+                      ? pluginData.platform
+                      : [],
               })
             }
           }

@@ -4,6 +4,7 @@ import asyncio
 import os
 import traceback
 import uuid
+from typing import Any
 
 import aiofiles
 from quart import request
@@ -11,6 +12,7 @@ from quart import request
 from astrbot.core import logger
 from astrbot.core.core_lifecycle import AstrBotCoreLifecycle
 from astrbot.core.provider.provider import EmbeddingProvider, RerankProvider
+from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 
 from ..utils import generate_tsne_visualization
 from .route import Response, Route, RouteContext
@@ -75,7 +77,7 @@ class KnowledgeBaseRoute(Route):
         }
 
     def _set_task_result(
-        self, task_id: str, status: str, result: any = None, error: str | None = None
+        self, task_id: str, status: str, result: Any = None, error: str | None = None
     ) -> None:
         self.upload_tasks[task_id] = {
             "status": status,
@@ -113,7 +115,7 @@ class KnowledgeBaseRoute(Route):
             p["total"] = total
 
     def _make_progress_callback(self, task_id: str, file_idx: int, file_name: str):
-        async def _callback(stage: str, current: int, total: int):
+        async def _callback(stage: str, current: int, total: int) -> None:
             self._update_progress(
                 task_id,
                 status="processing",
@@ -126,6 +128,13 @@ class KnowledgeBaseRoute(Route):
 
         return _callback
 
+    @staticmethod
+    def _format_failed_doc_error(file_name: str, error: Exception) -> str:
+        message = str(error).strip() or "上传失败：发生未知错误。"
+        if message.startswith(file_name):
+            return message
+        return f"{file_name}: {message}"
+
     async def _background_upload_task(
         self,
         task_id: str,
@@ -136,7 +145,7 @@ class KnowledgeBaseRoute(Route):
         batch_size: int,
         tasks_limit: int,
         max_retries: int,
-    ):
+    ) -> None:
         """后台上传任务"""
         try:
             # 初始化任务状态
@@ -187,7 +196,12 @@ class KnowledgeBaseRoute(Route):
                 except Exception as e:
                     logger.error(f"上传文档 {file_info['file_name']} 失败: {e}")
                     failed_docs.append(
-                        {"file_name": file_info["file_name"], "error": str(e)},
+                        {
+                            "file_name": file_info["file_name"],
+                            "error": self._format_failed_doc_error(
+                                file_info["file_name"], e
+                            ),
+                        },
                     )
 
             # 更新任务完成状态
@@ -215,7 +229,7 @@ class KnowledgeBaseRoute(Route):
         batch_size: int,
         tasks_limit: int,
         max_retries: int,
-    ):
+    ) -> None:
         """后台导入预切片文档任务"""
         try:
             # 初始化任务状态
@@ -274,7 +288,10 @@ class KnowledgeBaseRoute(Route):
                 except Exception as e:
                     logger.error(f"导入文档 {file_name} 失败: {e}")
                     failed_docs.append(
-                        {"file_name": file_name, "error": str(e)},
+                        {
+                            "file_name": file_name,
+                            "error": self._format_failed_doc_error(file_name, e),
+                        },
                     )
 
             # 更新任务完成状态
@@ -312,7 +329,12 @@ class KnowledgeBaseRoute(Route):
             # 转换为字典列表
             kb_list = []
             for kb in kbs:
-                kb_list.append(kb.model_dump())
+                kb_dict = kb.model_dump()
+                # include init_error from KBHelper if present
+                kb_helper = await kb_manager.get_kb(kb.kb_id)
+                if kb_helper and kb_helper.init_error:
+                    kb_dict["init_error"] = kb_helper.init_error
+                kb_list.append(kb_dict)
 
             return (
                 Response()
@@ -702,7 +724,10 @@ class KnowledgeBaseRoute(Route):
                 file_name = file.filename
 
                 # 保存到临时文件
-                temp_file_path = f"data/temp/{uuid.uuid4()}_{file_name}"
+                temp_file_path = os.path.join(
+                    get_astrbot_temp_path(),
+                    f"kb_upload_{uuid.uuid4()}_{file_name}",
+                )
                 await file.save(temp_file_path)
 
                 try:
@@ -1214,7 +1239,7 @@ class KnowledgeBaseRoute(Route):
         max_retries: int,
         enable_cleaning: bool,
         cleaning_provider_id: str | None,
-    ):
+    ) -> None:
         """后台上传URL任务"""
         try:
             # 初始化任务状态

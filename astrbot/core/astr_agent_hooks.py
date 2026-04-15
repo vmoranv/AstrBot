@@ -12,7 +12,16 @@ from astrbot.core.star.star_handler import EventType
 
 
 class MainAgentHooks(BaseAgentRunHooks[AstrAgentContext]):
-    async def on_agent_done(self, run_context, llm_response):
+    async def on_agent_begin(
+        self, run_context: ContextWrapper[AstrAgentContext]
+    ) -> None:
+        await call_event_hook(
+            run_context.context.event,
+            EventType.OnAgentBeginEvent,
+            run_context,
+        )
+
+    async def on_agent_done(self, run_context, llm_response) -> None:
         # 执行事件钩子
         if llm_response and llm_response.reasoning_content:
             # we will use this in result_decorate stage to inject reasoning content to chain
@@ -25,13 +34,19 @@ class MainAgentHooks(BaseAgentRunHooks[AstrAgentContext]):
             EventType.OnLLMResponseEvent,
             llm_response,
         )
+        await call_event_hook(
+            run_context.context.event,
+            EventType.OnAgentDoneEvent,
+            run_context,
+            llm_response,
+        )
 
     async def on_tool_start(
         self,
         run_context: ContextWrapper[AstrAgentContext],
         tool: FunctionTool[Any],
         tool_args: dict | None,
-    ):
+    ) -> None:
         await call_event_hook(
             run_context.context.event,
             EventType.OnUsingLLMToolEvent,
@@ -45,7 +60,7 @@ class MainAgentHooks(BaseAgentRunHooks[AstrAgentContext]):
         tool: FunctionTool[Any],
         tool_args: dict | None,
         tool_result: CallToolResult | None,
-    ):
+    ) -> None:
         run_context.context.event.clear_result()
         await call_event_hook(
             run_context.context.event,
@@ -59,7 +74,13 @@ class MainAgentHooks(BaseAgentRunHooks[AstrAgentContext]):
         platform_name = run_context.context.event.get_platform_name()
         if (
             platform_name == "webchat"
-            and tool.name == "web_search_tavily"
+            and tool.name
+            in [
+                "web_search_baidu",
+                "web_search_tavily",
+                "web_search_bocha",
+                "web_search_brave",
+            ]
             and len(run_context.messages) > 0
             and tool_result
             and len(tool_result.content)

@@ -2,11 +2,13 @@ import asyncio
 import copy
 import os
 import traceback
+from collections.abc import Callable
 from typing import Protocol, runtime_checkable
 
 from astrbot.core import astrbot_config, logger, sp
 from astrbot.core.astrbot_config_mgr import AstrBotConfigManager
 from astrbot.core.db import BaseDatabase
+from astrbot.core.utils.error_redaction import safe_error
 
 from ..persona_mgr import PersonaManager
 from .entities import ProviderType
@@ -32,7 +34,7 @@ class ProviderManager:
         acm: AstrBotConfigManager,
         db_helper: BaseDatabase,
         persona_mgr: PersonaManager,
-    ):
+    ) -> None:
         self.reload_lock = asyncio.Lock()
         self.resource_lock = asyncio.Lock()
         self.persona_mgr = persona_mgr
@@ -71,6 +73,57 @@ class ProviderManager:
         self.curr_tts_provider_inst: TTSProvider | None = None
         """默认的 Text To Speech Provider 实例。已弃用，请使用 get_using_provider() 方法获取当前使用的 Provider 实例。"""
         self.db_helper = db_helper
+        self._provider_change_callback: (
+            Callable[[str, ProviderType, str | None], None] | None
+        ) = None
+        self._provider_change_hooks: list[
+            Callable[[str, ProviderType, str | None], None]
+        ] = []
+        self._mcp_init_task: asyncio.Task | None = None
+
+    def set_provider_change_callback(
+        self,
+        cb: Callable[[str, ProviderType, str | None], None] | None,
+    ) -> None:
+        # Backward-compatible single-callback setter.
+        # This callback coexists with register_provider_change_hook subscriptions.
+        self._provider_change_callback = cb
+
+    def register_provider_change_hook(
+        self,
+        hook: Callable[[str, ProviderType, str | None], None],
+    ) -> None:
+        if hook not in self._provider_change_hooks:
+            self._provider_change_hooks.append(hook)
+
+    def _notify_provider_changed(
+        self,
+        provider_id: str,
+        provider_type: ProviderType,
+        umo: str | None,
+    ) -> None:
+        if self._provider_change_callback is not None:
+            try:
+                self._provider_change_callback(provider_id, provider_type, umo)
+            except Exception as e:
+                logger.warning(
+                    "调用 provider 变更回调失败: provider_id=%s, type=%s, err=%s",
+                    provider_id,
+                    provider_type,
+                    safe_error("", e),
+                )
+        for hook in list(self._provider_change_hooks):
+            if hook is self._provider_change_callback:
+                continue
+            try:
+                hook(provider_id, provider_type, umo)
+            except Exception as e:
+                logger.warning(
+                    "调用 provider 变更钩子失败: provider_id=%s, type=%s, err=%s",
+                    provider_id,
+                    provider_type,
+                    safe_error("", e),
+                )
 
     @property
     def persona_configs(self) -> list:
@@ -92,7 +145,7 @@ class ProviderManager:
         provider_id: str,
         provider_type: ProviderType,
         umo: str | None = None,
-    ):
+    ) -> None:
         """设置提供商。
 
         Args:
@@ -111,6 +164,7 @@ class ProviderManager:
                 f"provider_perf_{provider_type.value}",
                 provider_id,
             )
+            self._notify_provider_changed(provider_id, provider_type, umo)
             return
         # 不启用提供商会话隔离模式的情况
 
@@ -126,6 +180,7 @@ class ProviderManager:
                 scope="global",
                 scope_id="global",
             )
+            self._notify_provider_changed(provider_id, provider_type, umo)
         elif provider_type == ProviderType.SPEECH_TO_TEXT and isinstance(
             prov,
             STTProvider,
@@ -137,6 +192,7 @@ class ProviderManager:
                 scope="global",
                 scope_id="global",
             )
+            self._notify_provider_changed(provider_id, provider_type, umo)
         elif provider_type == ProviderType.CHAT_COMPLETION and isinstance(
             prov,
             Provider,
@@ -148,6 +204,7 @@ class ProviderManager:
                 scope="global",
                 scope_id="global",
             )
+            self._notify_provider_changed(provider_id, provider_type, umo)
 
     async def get_provider_by_id(self, provider_id: str) -> Providers | None:
         """根据提供商 ID 获取提供商实例"""
@@ -187,6 +244,8 @@ class ProviderManager:
                     provider = self.provider_insts[0] if self.provider_insts else None
             elif provider_type == ProviderType.SPEECH_TO_TEXT:
                 provider_id = config["provider_stt_settings"].get("provider_id")
+                if not config["provider_stt_settings"].get("enable"):
+                    return None
                 if not provider_id:
                     return None
                 provider = self.inst_map.get(provider_id)
@@ -196,6 +255,8 @@ class ProviderManager:
                     )
             elif provider_type == ProviderType.TEXT_TO_SPEECH:
                 provider_id = config["provider_tts_settings"].get("provider_id")
+                if not config["provider_tts_settings"].get("enable"):
+                    return None
                 if not provider_id:
                     return None
                 provider = self.inst_map.get(provider_id)
@@ -213,7 +274,7 @@ class ProviderManager:
 
         return provider
 
-    async def initialize(self):
+    async def initialize(self) -> None:
         # 逐个初始化提供商
         for provider_config in self.providers_config:
             try:
@@ -274,10 +335,19 @@ class ProviderManager:
         if not self.curr_tts_provider_inst and self.tts_provider_insts:
             self.curr_tts_provider_inst = self.tts_provider_insts[0]
 
-        # 初始化 MCP Client 连接
-        asyncio.create_task(self.llm_tools.init_mcp_clients(), name="init_mcp_clients")
+        async def _init_mcp_clients_bg() -> None:
+            try:
+                await self.llm_tools.init_mcp_clients()
+            except Exception:
+                logger.error("MCP init background task failed", exc_info=True)
 
-    def dynamic_import_provider(self, type: str):
+        if self._mcp_init_task is None or self._mcp_init_task.done():
+            self._mcp_init_task = asyncio.create_task(
+                _init_mcp_clients_bg(),
+                name="provider-manager:mcp-init",
+            )
+
+    def dynamic_import_provider(self, type: str) -> None:
         """动态导入提供商适配器模块
 
         Args:
@@ -291,13 +361,29 @@ class ProviderManager:
                 from .sources.openai_source import (
                     ProviderOpenAIOfficial as ProviderOpenAIOfficial,
                 )
+            case "longcat_chat_completion":
+                from .sources.longcat_source import ProviderLongCat as ProviderLongCat
             case "zhipu_chat_completion":
                 from .sources.zhipu_source import ProviderZhipu as ProviderZhipu
             case "groq_chat_completion":
                 from .sources.groq_source import ProviderGroq as ProviderGroq
+            case "xai_chat_completion":
+                from .sources.xai_source import ProviderXAI as ProviderXAI
+            case "aihubmix_chat_completion":
+                from .sources.oai_aihubmix_source import (
+                    ProviderAIHubMix as ProviderAIHubMix,
+                )
+            case "openrouter_chat_completion":
+                from .sources.openrouter_source import (
+                    ProviderOpenRouter as ProviderOpenRouter,
+                )
             case "anthropic_chat_completion":
                 from .sources.anthropic_source import (
                     ProviderAnthropic as ProviderAnthropic,
+                )
+            case "kimi_code_chat_completion":
+                from .sources.kimi_code_source import (
+                    ProviderKimiCode as ProviderKimiCode,
                 )
             case "googlegenai_chat_completion":
                 from .sources.gemini_source import (
@@ -311,6 +397,10 @@ class ProviderManager:
                 from .sources.whisper_api_source import (
                     ProviderOpenAIWhisperAPI as ProviderOpenAIWhisperAPI,
                 )
+            case "mimo_stt_api":
+                from .sources.mimo_stt_api_source import (
+                    ProviderMiMoSTTAPI as ProviderMiMoSTTAPI,
+                )
             case "openai_whisper_selfhost":
                 from .sources.whisper_selfhosted_source import (
                     ProviderOpenAIWhisperSelfHost as ProviderOpenAIWhisperSelfHost,
@@ -322,6 +412,10 @@ class ProviderManager:
             case "openai_tts_api":
                 from .sources.openai_tts_api_source import (
                     ProviderOpenAITTSAPI as ProviderOpenAITTSAPI,
+                )
+            case "mimo_tts_api":
+                from .sources.mimo_tts_api_source import (
+                    ProviderMiMoTTSAPI as ProviderMiMoTTSAPI,
                 )
             case "genie_tts":
                 from .sources.genie_tts import (
@@ -383,6 +477,10 @@ class ProviderManager:
                 from .sources.bailian_rerank_source import (
                     BailianRerankProvider as BailianRerankProvider,
                 )
+            case "nvidia_rerank":
+                from .sources.nvidia_rerank_source import (
+                    NvidiaRerankProvider as NvidiaRerankProvider,
+                )
 
     def get_merged_provider_config(self, provider_config: dict) -> dict:
         """获取 provider 配置和 provider_source 配置合并后的结果
@@ -406,6 +504,26 @@ class ProviderManager:
                 merged_config["id"] = pc["id"]
                 pc = merged_config
         return pc
+
+    def get_provider_config_by_id(
+        self,
+        provider_id: str,
+        *,
+        merged: bool = False,
+    ) -> dict | None:
+        """Get a provider config by id.
+
+        Args:
+            provider_id: Provider id to resolve.
+            merged: Whether to merge provider_source config into the provider config.
+        """
+        for provider_config in self.providers_config:
+            if provider_config.get("id") != provider_id:
+                continue
+            if merged:
+                return self.get_merged_provider_config(provider_config)
+            return copy.deepcopy(provider_config)
+        return None
 
     def _resolve_env_key_list(self, provider_config: dict) -> dict:
         keys = provider_config.get("key", [])
@@ -434,7 +552,7 @@ class ProviderManager:
         provider_config["key"] = resolved_keys
         return provider_config
 
-    async def load_provider(self, provider_config: dict):
+    async def load_provider(self, provider_config: dict) -> None:
         # 如果 provider_source_id 存在且不为空，则从 provider_sources 中找到对应的配置并合并
         provider_config = self.get_merged_provider_config(provider_config)
 
@@ -591,7 +709,7 @@ class ProviderManager:
                 f"实例化 {provider_config['type']}({provider_config['id']}) 提供商适配器失败：{e}",
             )
 
-    async def reload(self, provider_config: dict):
+    async def reload(self, provider_config: dict) -> None:
         async with self.reload_lock:
             await self.terminate_provider(provider_config["id"])
             if provider_config["enable"]:
@@ -637,7 +755,7 @@ class ProviderManager:
     def get_insts(self):
         return self.provider_insts
 
-    async def terminate_provider(self, provider_id: str):
+    async def terminate_provider(self, provider_id: str) -> None:
         if provider_id in self.inst_map:
             logger.info(
                 f"终止 {provider_id} 提供商适配器({len(self.provider_insts)}, {len(self.stt_provider_insts)}, {len(self.tts_provider_insts)}) ...",
@@ -673,7 +791,7 @@ class ProviderManager:
 
     async def delete_provider(
         self, provider_id: str | None = None, provider_source_id: str | None = None
-    ):
+    ) -> None:
         """Delete provider and/or provider source from config and terminate the instances. Config will be saved after deletion."""
         async with self.resource_lock:
             # delete from config
@@ -693,7 +811,7 @@ class ProviderManager:
             config.save_config()
             logger.info(f"Provider {target_prov_ids} 已从配置中删除。")
 
-    async def update_provider(self, origin_provider_id: str, new_config: dict):
+    async def update_provider(self, origin_provider_id: str, new_config: dict) -> None:
         """Update provider config and reload the instance. Config will be saved after update."""
         async with self.resource_lock:
             npid = new_config.get("id", None)
@@ -717,7 +835,7 @@ class ProviderManager:
             # reload instance
             await self.reload(new_config)
 
-    async def create_provider(self, new_config: dict):
+    async def create_provider(self, new_config: dict) -> None:
         """Add new provider config and load the instance. Config will be saved after addition."""
         async with self.resource_lock:
             npid = new_config.get("id", None)
@@ -732,8 +850,17 @@ class ProviderManager:
             config.save_config()
             # load instance
             await self.load_provider(new_config)
+            # sync in-memory config for API queries (e.g., embedding provider list)
+            self.providers_config = astrbot_config["provider"]
 
-    async def terminate(self):
+    async def terminate(self) -> None:
+        if self._mcp_init_task and not self._mcp_init_task.done():
+            self._mcp_init_task.cancel()
+            try:
+                await self._mcp_init_task
+            except asyncio.CancelledError:
+                pass
+
         for provider_inst in self.provider_insts:
             if hasattr(provider_inst, "terminate"):
                 await provider_inst.terminate()  # type: ignore

@@ -7,7 +7,6 @@ from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.core import logger
 
 from .long_term_memory import LongTermMemory
-from .process_llm_request import ProcessLLMRequest
 
 
 class Main(star.Star):
@@ -18,8 +17,6 @@ class Main(star.Star):
             self.ltm = LongTermMemory(self.context.astrbot_config_mgr, self.context)
         except BaseException as e:
             logger.error(f"聊天增强 err: {e}")
-
-        self.proc_llm_req = ProcessLLMRequest(self.context)
 
     def ltm_enabled(self, event: AstrMessageEvent):
         ltmse = self.context.get_config(umo=event.unified_msg_origin)[
@@ -39,9 +36,9 @@ class Main(star.Star):
         if self.ltm_enabled(event) and self.ltm and has_image_or_plain:
             need_active = await self.ltm.need_active_reply(event)
 
-            group_icl_enable = self.context.get_config()["provider_ltm_settings"][
-                "group_icl_enable"
-            ]
+            group_icl_enable = self.context.get_config(umo=event.unified_msg_origin)[
+                "provider_ltm_settings"
+            ]["group_icl_enable"]
             if group_icl_enable:
                 """记录对话"""
                 try:
@@ -80,7 +77,6 @@ class Main(star.Star):
 
                     yield event.request_llm(
                         prompt=prompt,
-                        func_tool_manager=self.context.get_llm_tool_manager(),
                         session_id=event.session_id,
                         conversation=conv,
                     )
@@ -89,10 +85,10 @@ class Main(star.Star):
                     logger.error(f"主动回复失败: {e}")
 
     @filter.on_llm_request()
-    async def decorate_llm_req(self, event: AstrMessageEvent, req: ProviderRequest):
+    async def decorate_llm_req(
+        self, event: AstrMessageEvent, req: ProviderRequest
+    ) -> None:
         """在请求 LLM 前注入人格信息、Identifier、时间、回复内容等 System Prompt"""
-        await self.proc_llm_req.process_llm_request(event, req)
-
         if self.ltm and self.ltm_enabled(event):
             try:
                 await self.ltm.on_req_llm(event, req)
@@ -100,7 +96,9 @@ class Main(star.Star):
                 logger.error(f"ltm: {e}")
 
     @filter.on_llm_response()
-    async def record_llm_resp_to_ltm(self, event: AstrMessageEvent, resp: LLMResponse):
+    async def record_llm_resp_to_ltm(
+        self, event: AstrMessageEvent, resp: LLMResponse
+    ) -> None:
         """在 LLM 响应后记录对话"""
         if self.ltm and self.ltm_enabled(event):
             try:
@@ -109,7 +107,7 @@ class Main(star.Star):
                 logger.error(f"ltm: {e}")
 
     @filter.after_message_sent()
-    async def after_message_sent(self, event: AstrMessageEvent):
+    async def after_message_sent(self, event: AstrMessageEvent) -> None:
         """消息发送后处理"""
         if self.ltm and self.ltm_enabled(event):
             try:
